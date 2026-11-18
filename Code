@@ -1,0 +1,159 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+const char* WIFI_SSID         = "SRM-SD ESIOT";
+const char* WIFI_PASS         = "password";
+const char* SUPABASE_URL      = "https://********************************m.supabase.co";
+const char* SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.****************************I2NX0.nprM";
+const char* DEVICE_EMAIL      = "device@lms.test";
+const char* DEVICE_PASS       = "device123";
+
+#define STATUS_LED 2 
+#define LAB_LED    4 
+#define CLASS_BTN  0 
+
+#define POLL_MS        3000UL
+#define HEARTBEAT_MS   10000UL
+#define TOKEN_LIFE_MS  2700000UL  
+WiFiClientSecure secureClient;
+HTTPClient http;
+String        sbToken;
+unsigned long tokenAt = 0;
+bool          labOn   = false;
+int           failStreak = 0;
+String jsonStr(const String& s, const char* key) {
+  String pat = String("\"") + key + "\":\"";
+  int p = s.indexOf(pat);
+  if (p < 0) return "";
+  p += pat.length();
+  int e = s.indexOf('"', p);
+  return (e < 0) ? "" : s.substring(p, e);
+}
+
+bool sbLogin() {
+  http.begin(secureClient, String(SUPABASE_URL) + "/auth/v1/token?grant_type=password");
+  http.addHeader("apikey", SUPABASE_ANON_KEY);
+  http.addHeader("Content-Type", "application/json");
+  String body = String("{\"email\":\"") + DEVICE_EMAIL + "\",\"password\":\"" + DEVICE_PASS + "\"}";
+  int code = http.POST(body);
+  String resp = (code > 0) ? http.getString() : String("");
+  http.end();
+  secureClient.stop();
+  if (code == 200) {
+    sbToken = jsonStr(resp, "access_token");
+    tokenAt = millis();
+    Serial.println("[SB] device login OK");
+    return sbToken.length() > 0;
+  }
+  Serial.printf("[SB] login FAILED HTTP %d  %s\n", code, resp.substring(0, 150).c_str());
+  sbToken = "";
+  return false;
+}
+
+bool ensureToken() {
+  if (sbToken.length() && millis() - tokenAt < TOKEN_LIFE_MS) return true;
+  static unsigned long lastTry = 0;
+  if (lastTry && millis() - lastTry < 15000UL) return false;   // back off after a failure
+  lastTry = millis();
+  return sbLogin();
+}
+int sbCall(const char* method, const String& path, const String& body, String& out, bool minimal = false) {
+  if (!ensureToken()) return -1;
+  http.begin(secureClient, String(SUPABASE_URL) + path);
+  http.addHeader("apikey", SUPABASE_ANON_KEY);
+  http.addHeader("Authorization", String("Bearer ") + sbToken);
+  http.addHeader("Content-Type", "application/json");
+  if (minimal) http.addHeader("Prefer", "return=minimal");
+  int code = http.sendRequest(method, (uint8_t*)body.c_str(), body.length());
+  out = (code > 0) ? http.getString() : String("");
+  http.end();
+  secureClient.stop(); 
+  if (code < 0) failStreak++; else failStreak = 0;
+  if (code == 401) sbToken = "";
+  return code;
+}
+
+void pollLab() {
+  String out;
+  int code = sbCall("GET", "/rest/v1/device_state?id=eq.1&select=lab_on", "", out);
+  if (code == 200) {
+    bool on = out.indexOf("\"lab_on\":true") >= 0;
+    digitalWrite(LAB_LED, on ? HIGH : LOW);
+    if (on != labOn) { labOn = on; Serial.printf("[LAB] light %s\n", on ? "ON" : "OFF"); }
+  } else if (code != -1) {
+    Serial.printf("[SB] poll failed HTTP %d %s\n", code, out.substring(0, 120).c_str());
+  }
+}
+
+void sendHeartbeat() {
+  String body = String("{\"rssi\":") + String(WiFi.RSSI()) +
+                ",\"ip\":\"" + WiFi.localIP().toString() +
+                "\",\"uptime\":" + String((unsigned long)(millis() / 1000)) + "}";
+  String out;
+  int code = sbCall("PATCH", "/rest/v1/device_state?id=eq.1", body, out, true);
+  Serial.printf("[SB] heartbeat HTTP %d\n", code);
+}
+
+void postClassStart() {
+  String out;
+  int code = sbCall("POST", "/rest/v1/announcements",
+                    "{\"author\":\"ESP32\",\"text\":\"Class is starting now - please check in.\"}", out, true);
+  Serial.printf("[SB] class-start announcement HTTP %d\n", code);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(LAB_LED, OUTPUT);
+  pinMode(CLASS_BTN, INPUT_PULLUP);
+  digitalWrite(LAB_LED, LOW);
+
+  secureClient.setInsecure(); 
+  http.setReuse(false);
+  http.setTimeout(8000);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WiFi] Connecting to '%s'", WIFI_SSID);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300); Serial.print('.');
+    if (millis() - t0 > 30000UL) { Serial.println("\n[WiFi] failed, restarting"); ESP.restart(); }
+  }
+  Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+void loop() {
+  static unsigned long lastPoll = 0, lastBeat = 0, lastPress = 0;
+  static bool lastBtn = HIGH;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    digitalWrite(STATUS_LED, LOW);
+    WiFi.reconnect();
+    delay(1000);
+    return;
+  }
+  digitalWrite(STATUS_LED, HIGH);
+
+  if (failStreak >= 15) {    
+    Serial.println("[SYS] too many failed requests, restarting");
+    delay(200);
+    ESP.restart();
+  }
+
+  bool b = digitalRead(CLASS_BTN);
+  if (lastBtn == HIGH && b == LOW && millis() - lastPress > 500) {
+    lastPress = millis();
+    postClassStart();
+  }
+  lastBtn = b;
+
+  if (lastBeat == 0 || millis() - lastBeat >= HEARTBEAT_MS) { lastBeat = millis(); sendHeartbeat(); }
+  if (millis() - lastPoll >= POLL_MS)                       { lastPoll = millis(); pollLab(); }
+
+  delay(5);
+}
